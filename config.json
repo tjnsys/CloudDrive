@@ -1,0 +1,11 @@
+{
+	"storage": [
+		{
+			"name": "Box",
+			"client_id": "*",
+			"client_secret": "*",
+			"user": "*@*",
+			"pass": "********"
+		}
+	]
+}
