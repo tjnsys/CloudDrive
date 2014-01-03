@@ -4,24 +4,28 @@ var querystring = require("querystring");
 
 exports.BoxAuth = BoxAuth;
 
-function BoxAuth(clientID, clientSecret) {
+function BoxAuth(clientID, clientSecret, refreshAuto) {
 	this.clientID = clientID;
 	this.clientSecret = clientSecret;
 	this.verbose = false;
 	this.headers = {};
-	this.defineHandler1();
-	this.defineHandler2();
-	this.defineHandler3();
-	this.accessCode = "unknown";
-	this.next = function(){};
+	this.defineAuthHandler();
+	this.defineLoginHandler();
+	this.defineGrantHandler();
+	this.defineTokenHandler();
+	this.defineRefreshTokenHandler();
+	this.token = "unknown";
+	this.refreshToken = "unknown";
+	this.tokenListener = undefined;
+	this.refreshAuto = refreshAuto;
 }
 
-BoxAuth.prototype.defineHandler1 = function() {
+BoxAuth.prototype.defineAuthHandler = function() {
 	var myself = this;
-	this.authorizeHandler1 = function(res) {
+	this.authHandler = function(res) {
 		if (myself.verbose) {
-			console.log("Response status1: " + res.statusCode);
-			console.log("Response headers1: " + JSON.stringify(res.headers));
+			console.log("Auth response: " + res.statusCode);
+			console.log("Auth response headers: " + JSON.stringify(res.headers));
 		}
 		var cookies = [];
 		var resCookies = res.headers["set-cookie"];
@@ -39,7 +43,7 @@ BoxAuth.prototype.defineHandler1 = function() {
 		});
 		res.on("end", function() {
 			if (myself.verbose) {
-				console.log(data);
+				console.log("Auth response body: " + data);
 			}
 			var doc = jsdom.jsdom(data);
 			var window = doc.createWindow();
@@ -63,10 +67,10 @@ BoxAuth.prototype.defineHandler1 = function() {
 				headers: myself.headers
 			};
 			if (myself.verbose) {
-				console.log(options);
-				console.log(querystring.stringify(params));
+				console.log("Login request with:", options);
+				console.log("Login request params: " + querystring.stringify(params));
 			}
-			var req = https.request(options, myself.authorizeHandler2);
+			var req = https.request(options, myself.loginHandler);
 			req.write(querystring.stringify(params));
 			req.on("error", function(err) {
 				console.log("HTTP request error: " + err.message);
@@ -76,12 +80,12 @@ BoxAuth.prototype.defineHandler1 = function() {
 	}
 }
 
-BoxAuth.prototype.defineHandler2 = function() {
+BoxAuth.prototype.defineLoginHandler = function() {
 	var myself = this;
-	this.authorizeHandler2 = function(res) {
+	this.loginHandler = function(res) {
 		if (myself.verbose) {
-			console.log("Response status2: " + res.statusCode);
-			console.log("Response headers2: " + JSON.stringify(res.headers));
+			console.log("Login response status: " + res.statusCode);
+			console.log("Login response headers: " + JSON.stringify(res.headers));
 		}
 		res.setEncoding("utf8");
 		var cookies = [];
@@ -98,7 +102,7 @@ BoxAuth.prototype.defineHandler2 = function() {
 		});
 		res.on("end", function() {
 			if (myself.verbose) {
-				console.log(data);
+				console.log("Login response body: " + data);
 			}
 			myself.headers["Content-Type"] = "application/x-www-form-urlencoded";
 			var doc = jsdom.jsdom(data);
@@ -119,10 +123,10 @@ BoxAuth.prototype.defineHandler2 = function() {
 				headers: myself.headers
 			};
 			if (myself.verbose) {
-				console.log(options);
-				console.log(querystring.stringify(params));
+				console.log("Grant request with:", options);
+				console.log("Grant request params: " + querystring.stringify(params));
 			}
-			var req = https.request(options, myself.authorizeHandler3);
+			var req = https.request(options, myself.grantHandler);
 			req.write(querystring.stringify(params));
 			req.on("error", function(err) {
 				console.log("HTTP request error: " + err.message);
@@ -132,12 +136,12 @@ BoxAuth.prototype.defineHandler2 = function() {
 	}
 }
 
-BoxAuth.prototype.defineHandler3 = function() {
+BoxAuth.prototype.defineGrantHandler = function() {
 	var myself = this;
-	this.authorizeHandler3 = function(res) {
+	this.grantHandler = function(res) {
 		if (myself.verbose) {
-			console.log("Response status3: " + res.statusCode);
-			console.log("Response headers3: " + JSON.stringify(res.headers));
+			console.log("Grant response status: " + res.statusCode);
+			console.log("Grant response headers: " + JSON.stringify(res.headers));
 		}
 		res.setEncoding("utf8");
 		var data = "";
@@ -146,29 +150,127 @@ BoxAuth.prototype.defineHandler3 = function() {
 		});
 		res.on("end", function() {
 			if (myself.verbose) {
-				console.log(data);
+				console.log("Grant response body: " + data);
 			}
+			var accessCode = res.headers["location"].match(/.*&code=(.*)/)[1];
+			if (myself.verbose) {
+				console.log("Access code: " + accessCode);
+			}
+			myself.getAccessToken(accessCode);
 		});
-		myself.accessCode = res.headers["location"].match(/.*&code=(.*)/)[1];
-		myself.next();
 	}
 }
 
-BoxAuth.prototype.auth = function(login, password, listener) {
+BoxAuth.prototype.defineTokenHandler = function() {
+	var myself = this;
+	this.tokenHandler = function(res) {
+		if (myself.verbose) {
+			console.log("Token response status: " + res.statusCode);
+			console.log("Token response headers: " + JSON.stringify(res.headers));
+		}
+		res.setEncoding("utf8");
+		var data = "";
+		res.on("data", function(chunk) {
+			data += chunk;
+		});
+		res.on("end", function() {
+			if (myself.verbose) {
+				console.log("Token response body: " + data);
+			}
+			var items = JSON.parse(data);
+			myself.token = items["access_token"];
+			myself.refreshToken = items["refresh_token"];
+			// auto refresh token
+			if (myself.refreshAuto) {
+				var limit = items["expires_in"] * 1000;
+				setTimeout(myself.refreshTokenHandler, limit * 8 / 10);
+			}
+			// call token listener if exists
+			var tokenListener = myself.tokenListener;
+			myself.tokenListener = undefined;
+			if (tokenListener != undefined) {
+				tokenListener();
+			}
+		});
+	}
+}
+
+BoxAuth.prototype.defineRefreshTokenHandler = function() {
+	var myself = this;
+	this.refreshTokenHandler = function(res) {
+		var options = {
+			host: "app.box.com",
+			path: "/api/oauth2/token",
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" }
+		};
+		var params = {
+			grant_type: "refresh_token",
+			refresh_token: myself.refreshToken,
+			client_id: myself.clientID,
+			client_secret: myself.clientSecret
+		};
+		if (myself.verbose) {
+			console.log("Refresh-Token request with:", options);
+			console.log("Refresh-Token request params: " + querystring.stringify(params));
+		}
+		var req = https.request(options, myself.tokenHandler);
+		req.write(querystring.stringify(params));
+		req.on("error", function(err) {
+			console.log("HTTP request error: " + err.message);
+		});
+		req.end();
+	}
+}
+
+BoxAuth.prototype.auth = function(login, password, tokenListener) {
 	this.login = login;
 	this.password = password;
-	this.next = listener;
+	this.tokenListener = tokenListener;
+	var params = {
+		response_type: "code",
+		client_id: this.clientID
+	};
 	var options = {
 		host: "app.box.com",
-		path: "/api/oauth2/authorize?response_type=code&client_id=" + this.clientID,
-		method: "GET"
+		path: "/api/oauth2/authorize",
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" }
 	};
 	if (this.verbose) {
-		console.log(options);
+		console.log("Auth request with:", options);
+		console.log("Auth request params: " + querystring.stringify(params));
 	}
-	var req = https.request(options, this.authorizeHandler1);
+	var req = https.request(options, this.authHandler);
+	req.write(querystring.stringify(params));
 	req.on("error", function(err) {
 		console.log("HTTP request error: " + err.message);
 	});
 	req.end();
 }
+
+BoxAuth.prototype.getAccessToken = function(accessCode) {
+	var options = {
+		host: "app.box.com",
+		path: "/api/oauth2/token",
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" }
+	};
+	var params = {
+		grant_type: "authorization_code",
+		code: accessCode,
+		client_id: this.clientID,
+		client_secret: this.clientSecret
+	};
+	if (this.verbose) {
+		console.log("Token request with:", options);
+		console.log("Token request params: " + querystring.stringify(params));
+	}
+	var req = https.request(options, this.tokenHandler);
+	req.write(querystring.stringify(params));
+	req.on("error", function(err) {
+		console.log("HTTP request error: " + err.message);
+	});
+	req.end();
+}
+
